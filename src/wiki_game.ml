@@ -1,4 +1,38 @@
 open! Core
+module Article = String
+
+module Wiki_network = struct
+  module Connection = struct
+    module T = struct
+      type t = Article.t * Article.t [@@deriving compare, sexp]
+    end
+
+    include Comparable.Make (T)
+  end
+
+  type t = Connection.Set.t [@@deriving sexp_of]
+end
+
+module G = Graph.Imperative.Digraph.Concrete (Article)
+
+module Dot = Graph.Graphviz.Dot (struct
+    include G
+
+    let vertex_name v = v
+    let edge_attributes __LOC_OF__ = [ `Dir `Forward ]
+    let default_edge_attributes _ = []
+    let get_subgraph _ = None
+
+    let vertex_attributes v =
+      [ `Shape `Box
+      ; `Label (String.drop_suffix (String.drop_prefix v 1) 1)
+      ; `Fillcolor 1000
+      ]
+    ;;
+
+    let default_vertex_attributes _ = []
+    let graph_attributes _ = []
+  end)
 
 (* [get_linked_articles] should return a list of wikipedia article lengths contained in
    the input.
@@ -15,8 +49,19 @@ open! Core
    uniformity in article format. We can expect that all Wikipedia article links parsed
    from a Wikipedia page will have the form "/wiki/<TITLE>". *)
 let get_linked_articles contents : string list =
-  ignore (contents : string);
-  failwith "TODO"
+  let keep_link link =
+    let is_wiki = String.is_prefix link ~prefix:"/wiki" in
+    match Wikipedia_namespace.namespace link, is_wiki with
+    | None, true -> Some link
+    | _ -> None
+  in
+  let open Soup in
+  parse contents
+  $$ "a[href]"
+  |> to_list
+  |> List.map ~f:(R.attribute "href")
+  |> List.filter_map ~f:keep_link
+  |> List.dedup_and_sort ~compare:String.compare
 ;;
 
 let print_links_command =
@@ -35,20 +80,76 @@ let print_links_command =
    [how_to_fetch] argument along with [File_fetcher] to fetch the articles so that the
    implementation can be tested locally on the small dataset in the ../resources/wiki
    directory. *)
-let visualize ?(max_depth = 3) ~origin ~output_file ~how_to_fetch () : unit =
-  ignore (max_depth : int);
-  ignore (origin : string);
-  ignore (output_file : File_path.t);
-  ignore (how_to_fetch : File_fetcher.How_to_fetch.t);
-  failwith "TODO"
+let visualize
+      ?(max_depth = 20)
+      ~origin
+      ~output_file
+      ~(how_to_fetch : File_fetcher.How_to_fetch.t)
+      ()
+  : unit
+  =
+  ignore max_depth;
+  let get_contents (how_to_fetch : File_fetcher.How_to_fetch.t) dest =
+    match how_to_fetch with
+    | Remote ->
+      File_fetcher.fetch_exn how_to_fetch ~resource:"en.wikipedia.org" ^ dest
+    | Local _ -> File_fetcher.fetch_exn how_to_fetch ~resource:dest
+  in
+  let convert_title article_link =
+    let contents = get_contents how_to_fetch article_link in
+    let open Soup in
+    parse contents $ "title" |> R.leaf_text
+  in
+  let enclose_in_quotes s = String.of_char '"' ^ s ^ String.of_char '"' in
+  let bfs start_node =
+    let visited = String.Hash_set.create () in
+    let to_visit = Queue.create () in
+    let conns = Queue.create () in
+    Queue.enqueue to_visit start_node;
+    let rec traverse () =
+      match Queue.dequeue to_visit with
+      | None -> ()
+      | Some current_node ->
+        print_endline current_node;
+        if not (Hash_set.mem visited current_node)
+        then (
+          Hash_set.add visited current_node;
+          let adjacent_nodes =
+            let contents = get_contents how_to_fetch current_node in
+            get_linked_articles contents
+          in
+          List.iter
+            ~f:(fun adj_node ->
+              Queue.enqueue
+                conns
+                (convert_title current_node, convert_title adj_node);
+              Queue.enqueue to_visit adj_node;
+              (* print_endline (current_node ^ " " ^ adj_node); *)
+              ())
+            adjacent_nodes);
+        traverse ()
+    in
+    traverse ();
+    Queue.to_list conns
+  in
+  let graph = G.create () in
+  let conns = bfs ("/" ^ origin) in
+  List.iter conns ~f:(fun (from_article, to_article) ->
+    G.add_edge
+      graph
+      (enclose_in_quotes from_article)
+      (enclose_in_quotes to_article));
+  Dot.output_graph
+    (Out_channel.create (File_path.to_string output_file))
+    graph
 ;;
 
 let visualize_command =
   let open Command.Let_syntax in
   Command.basic
     ~summary:
-      "parse a file listing interstates and generate a graph visualizing the highway \
-       network"
+      "parse a file listing interstates and generate a graph visualizing \
+       the highway network"
     [%map_open
       let how_to_fetch = File_fetcher.How_to_fetch.param
       and origin = flag "origin" (required string) ~doc:" the starting page"
@@ -87,11 +188,14 @@ let find_path ?(max_depth = 3) ~origin ~destination ~how_to_fetch () =
 let find_path_command =
   let open Command.Let_syntax in
   Command.basic
-    ~summary:"Play wiki game by finding a link between the origin and destination pages"
+    ~summary:
+      "Play wiki game by finding a link between the origin and destination \
+       pages"
     [%map_open
       let how_to_fetch = File_fetcher.How_to_fetch.param
       and origin = flag "origin" (required string) ~doc:" the starting page"
-      and destination = flag "destination" (required string) ~doc:" the destination page"
+      and destination =
+        flag "destination" (required string) ~doc:" the destination page"
       and max_depth =
         flag
           "max-depth"
