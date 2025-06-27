@@ -47,8 +47,9 @@ module Dot = Graph.Graphviz.Dot (struct
 
    One nice think about Wikipedia is that stringent content moderation results in
    uniformity in article format. We can expect that all Wikipedia article links parsed
-   from a Wikipedia page will have the form "/wiki/<TITLE>". *)
-let get_linked_articles contents : string list =
+   from a Wikipedia page will have =
+   let keep_link link =the form "/wiki/<TITLE>". *)
+let get_linked_articles contents =
   let keep_link link =
     let is_wiki = String.is_prefix link ~prefix:"/wiki" in
     match Wikipedia_namespace.namespace link, is_wiki with
@@ -64,6 +65,11 @@ let get_linked_articles contents : string list =
   |> List.dedup_and_sort ~compare:String.compare
 ;;
 
+let get_article_title contents =
+  let open Soup in
+  parse contents $ "title" |> R.leaf_text
+;;
+
 let print_links_command =
   let open Command.Let_syntax in
   Command.basic
@@ -75,65 +81,63 @@ let print_links_command =
         List.iter (get_linked_articles contents) ~f:print_endline]
 ;;
 
+let get_contents (how_to_fetch : File_fetcher.How_to_fetch.t) destination =
+  match how_to_fetch with
+  | Remote ->
+    File_fetcher.fetch_exn how_to_fetch ~resource:"en.wikipedia.org"
+    ^ destination
+  | Local _ -> File_fetcher.fetch_exn how_to_fetch ~resource:destination
+;;
+
+let bfs start_node max_depth how_to_fetch =
+  let visited = String.Hash_set.create () in
+  let to_visit = Queue.create () in
+  let conns = Queue.create () in
+  Queue.enqueue to_visit start_node;
+  let rec traverse depth =
+    if depth >= 0
+    then (
+      match Queue.dequeue to_visit with
+      | None -> ()
+      | Some current_node ->
+        if not (Hash_set.mem visited current_node)
+        then (
+          Hash_set.add visited current_node;
+          let contents = get_contents how_to_fetch current_node in
+          let to_links = get_linked_articles contents in
+          let from_title = get_article_title contents in
+          List.iter
+            ~f:(fun adj_node ->
+              let to_title =
+                get_article_title (get_contents how_to_fetch adj_node)
+              in
+              Queue.enqueue conns (from_title, to_title);
+              Queue.enqueue to_visit adj_node;
+              print_endline (from_title ^ " " ^ to_title ^ " " ^ Int.to_string depth);
+              ())
+            to_links);
+        traverse (depth - 1))
+  in
+  traverse max_depth;
+  Queue.to_list conns
+;;
+
 (* [visualize] should explore all linked articles up to a distance of [max_depth] away
    from the given [origin] article, and output the result as a DOT file. It should use the
    [how_to_fetch] argument along with [File_fetcher] to fetch the articles so that the
    implementation can be tested locally on the small dataset in the ../resources/wiki
    directory. *)
 let visualize
-      ?(max_depth = 20)
+      ?(max_depth = 3)
       ~origin
       ~output_file
       ~(how_to_fetch : File_fetcher.How_to_fetch.t)
       ()
   : unit
   =
-  ignore max_depth;
-  let get_contents (how_to_fetch : File_fetcher.How_to_fetch.t) dest =
-    match how_to_fetch with
-    | Remote ->
-      File_fetcher.fetch_exn how_to_fetch ~resource:"en.wikipedia.org" ^ dest
-    | Local _ -> File_fetcher.fetch_exn how_to_fetch ~resource:dest
-  in
-  let convert_title article_link =
-    let contents = get_contents how_to_fetch article_link in
-    let open Soup in
-    parse contents $ "title" |> R.leaf_text
-  in
   let enclose_in_quotes s = String.of_char '"' ^ s ^ String.of_char '"' in
-  let bfs start_node =
-    let visited = String.Hash_set.create () in
-    let to_visit = Queue.create () in
-    let conns = Queue.create () in
-    Queue.enqueue to_visit start_node;
-    let rec traverse () =
-      match Queue.dequeue to_visit with
-      | None -> ()
-      | Some current_node ->
-        print_endline current_node;
-        if not (Hash_set.mem visited current_node)
-        then (
-          Hash_set.add visited current_node;
-          let adjacent_nodes =
-            let contents = get_contents how_to_fetch current_node in
-            get_linked_articles contents
-          in
-          List.iter
-            ~f:(fun adj_node ->
-              Queue.enqueue
-                conns
-                (convert_title current_node, convert_title adj_node);
-              Queue.enqueue to_visit adj_node;
-              (* print_endline (current_node ^ " " ^ adj_node); *)
-              ())
-            adjacent_nodes);
-        traverse ()
-    in
-    traverse ();
-    Queue.to_list conns
-  in
   let graph = G.create () in
-  let conns = bfs ("/" ^ origin) in
+  let conns = bfs ("/" ^ origin) max_depth how_to_fetch in
   List.iter conns ~f:(fun (from_article, to_article) ->
     G.add_edge
       graph
@@ -156,7 +160,7 @@ let visualize_command =
       and max_depth =
         flag
           "max-depth"
-          (optional_with_default 10 int)
+          (optional_with_default 3 int)
           ~doc:"INT maximum length of path to search for (default 10)"
       and output_file =
         flag
